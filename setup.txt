@@ -1,0 +1,2 @@
+pip install fastapi python-docx transformers torch scikit-learn openai uvicorn pandas numpy tqdm ipykernel notebook jupyter accelerate python-multipart runpod
+uvicorn app:app --host 0.0.0.0 --port 7860
