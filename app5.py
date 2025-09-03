@@ -96,7 +96,7 @@ print("OpenAI client ready:", bool(client))
 # =============================================================
 # Data
 # =============================================================
-DF_PATH = os.getenv("POLICY_CSV", "/root/runpod_backend/investor_rem_policies.csv")
+DF_PATH = os.getenv("POLICY_CSV", "investor_rem_policies.csv")
 df = pd.read_csv(DF_PATH)
 investor_policies = dict(zip(df["Investor"], df["RemunerationPolicy"]))
 
@@ -587,22 +587,25 @@ def upload_file(request: Request, file: UploadFile = File(...), policy: str = Fo
         chunk_embeddings = get_embeddings(chunks, batch_size=64)
 
         # 3) Per-investor analysis
-        def analyze_investor(name, investor_policy, force_reason=False):  # UPDATED: force_reason arg
+        def analyze_investor(name, investor_policy, force_reason=False):
             policy_emb = get_embedding(investor_policy)
             sims = chunk_embeddings @ policy_emb
             top_idx = np.argsort(sims)[-TOP_K:][::-1]
             top_chunks = [chunks[i] for i in top_idx]
             top_sims = sims[top_idx]
-
+        
             scored = [(c, *predict_vote(investor_policy, c)) for c in top_chunks]
             maj, conf, frac, mean_prob = weighted_decision(scored, top_sims)
-
-            # Prepare data attributes
-            verdict = "AGAINST" if maj == AGAINST_LABEL else "FOR"
-
-            # UPDATED: show reason if model predicts AGAINST OR investor is in CSV against list
-            need_reason = (maj == AGAINST_LABEL) or bool(force_reason)
-
+        
+            # NEW: if this investor appeared in the CSV "against" list,
+            # override the displayed verdict to AGAINST (but keep model run unchanged)
+            maj_display = AGAINST_LABEL if bool(force_reason) else maj
+        
+            verdict = "AGAINST" if maj_display == AGAINST_LABEL else "FOR"
+        
+            # Show a reason whenever the displayed verdict is AGAINST
+            need_reason = (maj_display == AGAINST_LABEL)
+        
             reason_html = ""
             if need_reason:
                 if client is None or not OPENAI_API_KEY:
@@ -615,16 +618,16 @@ def upload_file(request: Request, file: UploadFile = File(...), policy: str = Fo
                     "<div style='background:#f7f7f7;padding:10px;border-left:4px solid #cc0000;"
                     "margin-top:6px;color:#333;'><b>Reason:</b><br>" + escape_html(reason_text) + "</div>"
                 )
-
-            # Minimal block: only Investor, Verdict (and Reason if needed)
+        
             yield (
                 f"<div class='result-block' data-investor='{html.escape(name, quote=True)}' "
                 f"data-verdict='{html.escape(verdict, quote=True)}'>"
                 f"<h3>Investor: {html.escape(name)}</h3>"
-                f"<h4>{'❌ AGAINST' if maj == AGAINST_LABEL else '✅ FOR'}</h4>"
+                f"<h4>{'❌ AGAINST' if maj_display == AGAINST_LABEL else '✅ FOR'}</h4>"
                 f"{reason_html}"
                 f"<hr></div>"
             )
+
 
         if policy.lower() == "all":
             for inv, pol in investor_policies.items():
