@@ -24,4 +24,4 @@ RUN pip install --no-cache-dir --upgrade pip \
 COPY . .
 
 ENV PORT=8080
-CMD ["uvicorn", "app5:app", "--host", "0.0.0.0", "--port", "8080"]
+CMD ["uvicorn", "app6:app", "--host", "0.0.0.0", "--port", "8080"]
