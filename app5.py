@@ -434,7 +434,13 @@ def login(username: str = Form(...), password: str = Form(...)):
         token = secrets.token_urlsafe(16)
         sessions[token] = username
         response = RedirectResponse(url="/", status_code=302)
-        response.set_cookie(key="session", value=token, httponly=True)
+        response.set_cookie(
+            key="session",
+            value=token,
+            httponly=True,
+            secure=True,       # Fly.io serves HTTPS, so True is correct
+            samesite="lax"     # use "none" if your frontend is on another domain (e.g., Netlify)
+        )
         return response
     return HTMLResponse("<h3>Invalid credentials. <a href='/login'>Try again</a></h3>", status_code=401)
 
@@ -645,4 +651,5 @@ def upload_file(request: Request, file: UploadFile = File(...), policy: str = Fo
             yield from analyze_investor(policy, pol, force_reason=(policy in csv_force_reason_investors))
 
     return StreamingResponse(stream(), media_type="text/html")
+
 
