@@ -410,6 +410,29 @@ def get_gpt_reason(policy_text: str, chunks: list[str]):
     except Exception as e:
         return f"(GPT error: {html.escape(str(e))})"
 
+
+import heapq
+
+def topk_chunks_by_sim(chunks, policy_emb, k=TOP_K, batch_size=64):
+    """Return (top_chunks, top_sims) without building the full N x D matrix."""
+    heap = []  # min-heap of (sim, global_idx)
+    idx_offset = 0
+    for i in range(0, len(chunks), batch_size):
+        batch = chunks[i:i+batch_size]
+        batch_embs = get_embeddings(batch, batch_size=batch_size)  # [B, D]
+        sims = batch_embs @ policy_emb  # [B]
+        for j, s in enumerate(sims):
+            gidx = idx_offset + j
+            if len(heap) < k:
+                heapq.heappush(heap, (float(s), gidx))
+            elif s > heap[0][0]:
+                heapq.heapreplace(heap, (float(s), gidx))
+        idx_offset += len(batch)
+    heap.sort(reverse=True)
+    top_idx = [g for (_, g) in heap]
+    top_sims = [s for (s, _) in heap]
+    return [chunks[i] for i in top_idx], np.array(top_sims, dtype=np.float32)
+
 # =============================================================
 # Routes
 # =============================================================
@@ -592,26 +615,27 @@ def upload_file(request: Request, file: UploadFile = File(...), policy: str = Fo
             return
         
         yield "<p>✅ Text extracted.</p>"
-        yield "<p>✂️ Chunking…</p>"
 
-        # after chunking (and before heavy work):
-        yield f"<p>⚙️ Computing embeddings & classifying for {html.escape(policy)}…</p>"
-        # 2) Chunk + embed
+        yield "<p>✂️ Chunking…</p>"
         chunks = chunk_text(full_text)
         if not chunks:
             yield "<p>Document is too short to chunk.</p>"
             return
-        chunk_embeddings = get_embeddings(chunks, batch_size=64)
+
+        yield f"<p>⚙️ Computing embeddings & classifying for {html.escape(policy)}…</p>"
+
+        if not chunks:
+            yield "<p>Document is too short to chunk.</p>"
+            return
         yield f"<p>🔹 Running selection & classification for {html.escape(policy)}…</p>"
 
         # 3) Per-investor analysis
         def analyze_investor(name, investor_policy, force_reason=False):
             policy_emb = get_embedding(investor_policy)
-            sims = chunk_embeddings @ policy_emb
-            top_idx = np.argsort(sims)[-TOP_K:][::-1]
-            top_chunks = [chunks[i] for i in top_idx]
-            top_sims = sims[top_idx]
-        
+
+    # NEW: select top-K per investor without keeping all embeddings
+            top_chunks, top_sims = topk_chunks_by_sim(chunks, policy_emb, k=TOP_K, batch_size=64)
+
             scored = [(c, *predict_vote(investor_policy, c)) for c in top_chunks]
             maj, conf, frac, mean_prob = weighted_decision(scored, top_sims)
         
@@ -658,7 +682,11 @@ def upload_file(request: Request, file: UploadFile = File(...), policy: str = Fo
                 return
             yield from analyze_investor(policy, pol, force_reason=(policy in csv_force_reason_investors))
 
-    return StreamingResponse(stream(), media_type="text/html")
+    return StreamingResponse(
+        stream(),
+        media_type="text/html",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+    )
 
 
 
