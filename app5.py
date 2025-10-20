@@ -523,7 +523,7 @@ def index(request: Request):
         const formData = new FormData(form);
         document.getElementById('loader').style.display = 'block';
         document.getElementById('results').innerHTML = '';
-        const response = await fetch('/upload', { method: 'POST', body: formData });
+        const response = await fetch('/upload', { method: 'POST', body: formData, credentials: 'include' });
         const reader = response.body.getReader();
         const decoder = new TextDecoder();
         while (true) {
@@ -654,6 +654,7 @@ def upload_file(request: Request, file: UploadFile = File(...), policy: str = Fo
             yield from analyze_investor(policy, pol, force_reason=(policy in csv_force_reason_investors))
 
     return StreamingResponse(stream(), media_type="text/html")
+
 
 
 
