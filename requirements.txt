@@ -1,0 +1,21 @@
+fastapi
+uvicorn[standard]
+numpy
+pandas
+torch               # CPU wheel is fine on Fly
+transformers
+sentence-transformers
+openai
+python-docx
+pymupdf             # a.k.a. fitz
+pdfminer.six
+PyPDF2
+pytesseract
+Pillow
+huggingface
+hf_transfer
+PyMuPDF 
+openai 
+tqdm 
+accelerate 
+python-multipart
