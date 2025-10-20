@@ -11,13 +11,13 @@ import html
 from io import BytesIO
 import numpy as np
 import pandas as pd
-import torch
 from transformers import AutoTokenizer, AutoModel, AutoModelForSequenceClassification
 from openai import OpenAI
 import docx
-import re  # NEW
+import re
+import heapq
 
-# Optional PDF/OCR libs (best-effort)
+# ---------- Optional PDF/OCR libs (best-effort) ----------
 try:
     import fitz  # PyMuPDF
 except Exception:
@@ -26,7 +26,7 @@ try:
     from pdfminer_high_level import extract_text as pdfminer_extract_text
 except Exception:
     try:
-        from pdfminer.high_level import extract_text as pdfminer_extract_text  # fallback import path
+        from pdfminer.high_level import extract_text as pdfminer_extract_text
     except Exception:
         pdfminer_extract_text = None
 try:
@@ -53,7 +53,9 @@ CLS_MODEL_NAME = os.getenv("CLS_MODEL_NAME", "Jaymin123321/Rem-Classifier")
 
 TOP_K = int(os.getenv("TOP_K", "20"))
 LOW_MARGIN = float(os.getenv("LOW_MARGIN", "0.1"))
-AGAINST_THRESHOLD = float(os.getenv("AGAINST_THRESHOLD", "0.01"))  # <- set to 0.01
+AGAINST_THRESHOLD = float(os.getenv("AGAINST_THRESHOLD", "0.01"))
+CHUNK_CAP = int(os.getenv("CHUNK_CAP", "300"))
+REM_KEYS = ("remuneration","compensation","pay","bonus","ltip","salary","incentive","director","executive")
 
 # Flip labels switch
 FLIP_LABELS = os.getenv("FLIP_LABELS", "1").strip() not in {"0", "false", "False", "no", "No"}
@@ -103,7 +105,7 @@ DF_PATH = os.getenv("POLICY_CSV", "investor_rem_policies.csv")
 df = pd.read_csv(DF_PATH)
 investor_policies = dict(zip(df["Investor"], df["RemunerationPolicy"]))
 
-# ---------- NEW: CSV mapping + name matching helpers ----------
+# ---------- CSV mapping + name matching helpers ----------
 CSV_MAP = {
     "autotrader": os.getenv("AUTOTRADER_CSV", "autotrader_against_votes.csv"),
     "unilever": os.getenv("UNILEVER_CSV", "unilever_against_votes.csv"),
@@ -112,30 +114,25 @@ CSV_MAP = {
 }
 
 def _tokenize_name(s: str) -> list[str]:
-    """Lowercase, alnum-only tokens for name matching."""
     return [t for t in re.findall(r"[A-Za-z0-9]+", str(s).lower()) if t]
 
 def _prefix_key_from_tokens(tokens: list[str]) -> str:
-    """First two tokens joined if available; otherwise first token; else empty."""
     if not tokens:
         return ""
     return " ".join(tokens[:2]) if len(tokens) >= 2 else tokens[0]
 
-# Build an index of investor prefixes (first 1 and first 2 tokens) -> investor names
 INVESTOR_PREFIX_INDEX: dict[str, set[str]] = {}
 for inv_name in investor_policies.keys():
     toks = _tokenize_name(inv_name)
     keys = set()
     if toks:
-        keys.add(toks[0])                    # first token
-        keys.add(_prefix_key_from_tokens(toks))  # first two tokens (or one if only one)
+        keys.add(toks[0])
+        keys.add(_prefix_key_from_tokens(toks))
     for k in keys:
-        if not k:
-            continue
-        INVESTOR_PREFIX_INDEX.setdefault(k, set()).add(inv_name)
+        if k:
+            INVESTOR_PREFIX_INDEX.setdefault(k, set()).add(inv_name)
 
 def _pick_manager_col(df_csv: pd.DataFrame) -> str | None:
-    """Try common column names that could contain the manager/investor name."""
     lower = {c.lower(): c for c in df_csv.columns}
     candidates = [
         "vote manager", "manager", "votemanager",
@@ -145,14 +142,12 @@ def _pick_manager_col(df_csv: pd.DataFrame) -> str | None:
     for c in candidates:
         if c in lower:
             return lower[c]
-    # fallback: first object dtype column
     for c in df_csv.columns:
         if df_csv[c].dtype == object:
             return c
     return None
 
 def _filter_against_rows(df_csv: pd.DataFrame) -> pd.DataFrame:
-    """If a vote/decision column exists, keep only rows that look like AGAINST; otherwise return as-is."""
     lower = {c.lower(): c for c in df_csv.columns}
     vote_candidates = ["vote", "decision", "voteresult", "vote result", "resolution vote", "voted"]
     for c in vote_candidates:
@@ -160,52 +155,42 @@ def _filter_against_rows(df_csv: pd.DataFrame) -> pd.DataFrame:
             col = lower[c]
             ser = df_csv[col].astype(str).str.lower()
             mask = ser.str.contains("against")
-            # if any matches, filter; else keep all (maybe file is already only-against)
             if mask.any():
                 return df_csv[mask]
             break
     return df_csv
 
 def load_company_against_investors_from_csv(csv_path: str) -> set[str]:
-    """
-    Load the CSV and map vote-manager names to our investor list
-    using first-two-term (or first-term) prefix matching.
-    Returns a set of investor display names from investor_policies.
-    """
     matched: set[str] = set()
     try:
         df_csv = pd.read_csv(csv_path)
     except Exception:
         return matched
-
     df_csv = _filter_against_rows(df_csv)
     manager_col = _pick_manager_col(df_csv)
     if not manager_col:
         return matched
-
     for raw_name in df_csv[manager_col].dropna().astype(str).tolist():
         toks = _tokenize_name(raw_name)
-        key = _prefix_key_from_tokens(toks)  # first 2 terms; if not 2, first 1
+        key = _prefix_key_from_tokens(toks)
         tried = []
         if key:
             tried.append(key)
         if toks:
-            tried.append(toks[0])  # explicit single-term fallback (harmless if same as key)
-
+            tried.append(toks[0])
         for k in tried:
             invs = INVESTOR_PREFIX_INDEX.get(k)
             if invs:
                 matched.update(invs)
-                break  # stop after first successful match
-
+                break
     return matched
-# --------------------------------------------------------------
 
 # =============================================================
 # FastAPI setup
 # =============================================================
 app = FastAPI()
 sessions = {}
+# Same-origin → CORS not needed; keep permissive but harmless
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -224,9 +209,8 @@ def escape_html(s: str) -> str:
     return html.escape(s).replace("\n", "<br>")
 
 # =============================================================
-# File text extraction helpers
+# File text extraction
 # =============================================================
-
 def extract_text_from_docx_bytes(data: bytes) -> str:
     document = docx.Document(BytesIO(data))
     paras = [p.text for p in document.paragraphs if p.text and p.text.strip()]
@@ -283,7 +267,6 @@ def extract_text_from_pdf_bytes(data: bytes) -> str:
 # =============================================================
 # Embeddings
 # =============================================================
-
 def _mean_pool(last_hidden_state: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
     masked = last_hidden_state * attention_mask.unsqueeze(-1)
     lengths = attention_mask.sum(dim=1, keepdim=True).clamp_min(1)
@@ -309,7 +292,6 @@ def get_embedding(text: str):
 # =============================================================
 # Chunking
 # =============================================================
-
 def chunk_text(text: str, max_tokens: int = 512, stride: int = 256, min_tokens: int = 16):
     original_max = getattr(emb_tokenizer, "model_max_length", 512)
     try:
@@ -330,92 +312,60 @@ def chunk_text(text: str, max_tokens: int = 512, stride: int = 256, min_tokens: 
     return chunks
 
 # =============================================================
-# Classifier
+# Classifier helpers
 # =============================================================
 @torch.no_grad()
-def predict_vote(policy: str, chunk: str, max_length: int = 512):
+def batch_predict_votes(policy: str, chunk_list: list[str], max_length: int = 512):
+    # encode policy once
     p = cls_tokenizer(policy, truncation=True, max_length=max_length//2, add_special_tokens=False)
-    c = cls_tokenizer(chunk, truncation=True, max_length=max_length//2, add_special_tokens=False)
+    p_ids = p["input_ids"]
 
-    ids = cls_tokenizer.build_inputs_with_special_tokens(p["input_ids"], c["input_ids"])
-    token_type_ids = cls_tokenizer.create_token_type_ids_from_sequences(p["input_ids"], c["input_ids"])
-    if len(ids) > max_length:
-        ids = ids[:max_length]
-        token_type_ids = token_type_ids[:max_length]
-    attention_mask = [1] * len(ids)
+    ids_batch, tti_batch, am_batch = [], [], []
+    pad_id = cls_tokenizer.pad_token_id or 0
 
-    inputs = {
-        "input_ids": torch.tensor([ids], dtype=torch.long, device=device),
-        "attention_mask": torch.tensor([attention_mask], dtype=torch.long, device=device),
-        "token_type_ids": torch.tensor([token_type_ids], dtype=torch.long, device=device),
-    }
-    logits = classifier_model(**inputs).logits.squeeze(0)
+    for c in chunk_list:
+        c_enc = cls_tokenizer(c, truncation=True, max_length=max_length//2, add_special_tokens=False)
+        ids = cls_tokenizer.build_inputs_with_special_tokens(p_ids, c_enc["input_ids"])
+        tti = cls_tokenizer.create_token_type_ids_from_sequences(p_ids, c_enc["input_ids"])
+        if len(ids) > max_length:
+            ids = ids[:max_length]
+            tti = tti[:max_length]
+        ids_batch.append(ids)
+        tti_batch.append(tti)
+        am_batch.append([1] * len(ids))
 
-    if NUM_LABELS == 1:
-        prob_against = torch.sigmoid(logits).item()
-        pred = AGAINST_LABEL if prob_against >= 0.5 else FOR_LABEL
+    L = max(len(x) for x in ids_batch)
+    def pad(seq, val): return seq + [val]*(L - len(seq))
+
+    input_ids = torch.tensor([pad(x, pad_id) for x in ids_batch], dtype=torch.long, device=device)
+    token_type_ids = torch.tensor([pad(x, 0) for x in tti_batch], dtype=torch.long, device=device)
+    attention_mask = torch.tensor([pad(x, 0) for x in am_batch], dtype=torch.long, device=device)
+
+    logits = classifier_model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        token_type_ids=token_type_ids,
+    ).logits  # [B, C]
+
+    if logits.ndim == 1 or logits.size(-1) == 1:
+        probs_against = torch.sigmoid(logits).squeeze(-1).cpu().numpy()
+        pred_labels = (probs_against >= 0.5).astype(int)
+        pred_labels = np.where(pred_labels == 1, AGAINST_LABEL, FOR_LABEL)
     else:
-        probs = torch.softmax(logits, dim=-1)
-        prob_against = probs[AGAINST_INDEX].item()
-        prob_for = probs[FOR_INDEX].item()
-        pred = AGAINST_LABEL if prob_against >= prob_for else FOR_LABEL
+        probs = torch.softmax(logits, dim=-1).cpu().numpy()
+        probs_against = probs[:, AGAINST_INDEX]
+        probs_for = probs[:, FOR_INDEX]
+        pred_labels = np.where(probs_against >= probs_for, AGAINST_LABEL, FOR_LABEL)
 
     if FLIP_LABELS:
-        pred = FOR_LABEL if pred == AGAINST_LABEL else AGAINST_LABEL
-        prob_against = 1.0 - prob_against
+        pred_labels = np.where(pred_labels == AGAINST_LABEL, FOR_LABEL, AGAINST_LABEL)
+        probs_against = 1.0 - probs_against
 
-    return pred, float(prob_against)
+    return pred_labels.tolist(), probs_against.tolist()
 
-# =============================================================
-# Decision helpers
-# =============================================================
-
-def weighted_decision(scored, sims):
-    votes = np.array([v for _, v, _ in scored], dtype=float)
-    probs = np.array([p for _, _, p in scored], dtype=float)
-    weights = sims + 1e-8
-    weights = weights / weights.sum()
-
-    votes_against = (votes == AGAINST_LABEL).astype(float)
-
-    weighted_frac_against = float((votes_against * weights).sum())
-    weighted_mean_prob = float((probs * weights).sum())
-
-    maj = AGAINST_LABEL if weighted_frac_against >= AGAINST_THRESHOLD else FOR_LABEL
-    conf = abs(weighted_mean_prob - 0.5)
-    return maj, conf, weighted_frac_against, weighted_mean_prob
-
-# =============================================================
-# GPT Reason Helper
-# =============================================================
-
-def get_gpt_reason(policy_text: str, chunks: list[str]):
-    if client is None:
-        return None
-    formatted_chunks = "\n".join(f"- {c}" for c in chunks[:TOP_K])
-    prompt = (
-        "An investor policy states:\n\n" + policy_text + "\n\n" +
-        "The company has disclosed the following relevant information:\n\n" + formatted_chunks + "\n\n" +
-        "Why might this investor vote AGAINST this resolution? Please include specific references to the company report and the investor policy."
-    )
-    try:
-        response = client.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=[
-                {"role": "system", "content": "You are an expert in corporate governance and ESG voting."},
-                {"role": "user", "content": prompt}
-            ]
-        )
-        return response.choices[0].message.content.strip()
-    except Exception as e:
-        return f"(GPT error: {html.escape(str(e))})"
-
-
-import heapq
-
-def topk_chunks_by_sim(chunks, policy_emb, k=TOP_K, batch_size=64):
-    """Return (top_chunks, top_sims) without building the full N x D matrix."""
-    heap = []  # min-heap of (sim, global_idx)
+# Streaming top-K: no full N×D matrix in RAM
+def topk_chunks_by_sim(chunks, policy_emb, k=TOP_K, batch_size=32):
+    heap = []  # (sim, global_idx)
     idx_offset = 0
     for i in range(0, len(chunks), batch_size):
         batch = chunks[i:i+batch_size]
@@ -423,20 +373,33 @@ def topk_chunks_by_sim(chunks, policy_emb, k=TOP_K, batch_size=64):
         sims = batch_embs @ policy_emb  # [B]
         for j, s in enumerate(sims):
             gidx = idx_offset + j
+            s = float(s)
             if len(heap) < k:
-                heapq.heappush(heap, (float(s), gidx))
+                heapq.heappush(heap, (s, gidx))
             elif s > heap[0][0]:
-                heapq.heapreplace(heap, (float(s), gidx))
+                heapq.heapreplace(heap, (s, gidx))
         idx_offset += len(batch)
     heap.sort(reverse=True)
-    top_idx = [g for (_, g) in heap]
-    top_sims = [s for (s, _) in heap]
+    top_idx = [g for (s, g) in heap]
+    top_sims = [s for (s, g) in heap]
     return [chunks[i] for i in top_idx], np.array(top_sims, dtype=np.float32)
+
+# =============================================================
+# Precompute investor embeddings (big speedup)
+# =============================================================
+print("Precomputing investor embeddings...")
+INVESTOR_EMBS: dict[str, np.ndarray] = {}
+with torch.no_grad():
+    if investor_policies:
+        names, texts = zip(*investor_policies.items())
+        vecs = get_embeddings(list(texts), batch_size=32)
+        for n, v in zip(names, vecs):
+            INVESTOR_EMBS[n] = v
+print(f"Cached {len(INVESTOR_EMBS)} investor embeddings.")
 
 # =============================================================
 # Routes
 # =============================================================
-
 @app.get("/healthz")
 def healthz():
     return {"status": "ok"}
@@ -464,8 +427,8 @@ def login(username: str = Form(...), password: str = Form(...)):
             key="session",
             value=token,
             httponly=True,
-            secure=True,       # Fly.io serves HTTPS, so True is correct
-            samesite="lax"     # use "none" if your frontend is on another domain (e.g., Netlify)
+            secure=True,   # HTTPS on Fly
+            samesite="lax" # same-origin; use "none" if different domains
         )
         return response
     return HTMLResponse("<h3>Invalid credentials. <a href='/login'>Try again</a></h3>", status_code=401)
@@ -514,14 +477,12 @@ def index(request: Request):
             alert('No results to export yet. Run an analysis first.');
             return;
           }
-          // Only Investor, Verdict
           const rows = [['Investor','Verdict']];
           blocks.forEach(block => {
             const investor = block.getAttribute('data-investor') || '';
             const verdict  = block.getAttribute('data-verdict')  || '';
             rows.push([investor, verdict]);
           });
-
           const csv = '\\ufeff' + rows.map(r => r.map(toCSVCell).join(',')).join('\\n');
           const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
           const url  = URL.createObjectURL(blob);
@@ -547,6 +508,12 @@ def index(request: Request):
         document.getElementById('loader').style.display = 'block';
         document.getElementById('results').innerHTML = '';
         const response = await fetch('/upload', { method: 'POST', body: formData, credentials: 'include' });
+        if (!response.body) {
+          const txt = await response.text();
+          document.getElementById('results').innerHTML = '<pre>' + txt + '</pre>';
+          document.getElementById('loader').style.display = 'none';
+          return;
+        }
         const reader = response.body.getReader();
         const decoder = new TextDecoder();
         while (true) {
@@ -572,7 +539,7 @@ def upload_file(request: Request, file: UploadFile = File(...), policy: str = Fo
     contents = file.file.read()
     filename = (file.filename or "").lower()
 
-    # ---------- NEW: infer company from filename & load CSV "against" investors ----------
+    # infer company from filename
     base = os.path.splitext(os.path.basename(filename))[0]
     company_key = None
     if "autotrader" in base:
@@ -595,9 +562,9 @@ def upload_file(request: Request, file: UploadFile = File(...), policy: str = Fo
                 print(f"[CSV] Failed to load {csv_path}: {_e}")
         else:
             print(f"[CSV] No CSV available or path missing for company '{company_key}'")
-    # ------------------------------------------------------------------------------------
 
     def stream():
+        # --- Extract text ---
         try:
             if filename.endswith(".docx"):
                 full_text = extract_text_from_docx_bytes(contents)
@@ -607,47 +574,59 @@ def upload_file(request: Request, file: UploadFile = File(...), policy: str = Fo
                 yield f"<p>Unsupported file type: {html.escape(filename)}. Please upload .docx or .pdf.</p>"
                 return
         except Exception as e:
-            yield f"<p>Error extracting text: {html.escape(str(e))}</p>"
+            yield f"<p>Error extracting text: {escape_html(str(e))}</p>"
             return
 
         if not full_text.strip():
             yield "<p>No readable text found in document.</p>"
             return
-        
+
         yield "<p>✅ Text extracted.</p>"
 
+        # --- Chunking + prefilter/cap ---
         yield "<p>✂️ Chunking…</p>"
         chunks = chunk_text(full_text)
+        if len(chunks) > CHUNK_CAP:
+            pri = [c for c in chunks if any(k in c.lower() for k in REM_KEYS)]
+            if len(pri) >= CHUNK_CAP:
+                chunks = pri[:CHUNK_CAP]
+            else:
+                tail_needed = CHUNK_CAP - len(pri)
+                # deterministic "rest": keep order, skip duplicates
+                seen = set(map(id, pri))
+                rest = []
+                for c in chunks:
+                    if id(c) in seen:
+                        continue
+                    rest.append(c)
+                    if len(rest) >= tail_needed:
+                        break
+                chunks = pri + rest
         if not chunks:
             yield "<p>Document is too short to chunk.</p>"
             return
+        yield f"<p>📦 Using {len(chunks)} chunks.</p>"
 
-        yield f"<p>⚙️ Computing embeddings & classifying for {html.escape(policy)}…</p>"
+        # --- Selection + classification ---
+        label = "all" if policy.lower() == "all" else policy
+        yield f"<p>⚙️ Computing embeddings & classifying for {html.escape(label)}…</p>"
 
-        if not chunks:
-            yield "<p>Document is too short to chunk.</p>"
-            return
-        yield f"<p>🔹 Running selection & classification for {html.escape(policy)}…</p>"
+        def analyze_investor(name: str, investor_policy: str, force_reason=False):
+            # cached embedding
+            policy_emb = INVESTOR_EMBS.get(name) or get_embedding(investor_policy)
 
-        # 3) Per-investor analysis
-        def analyze_investor(name, investor_policy, force_reason=False):
-            policy_emb = get_embedding(investor_policy)
+            # top-K without full matrix; smaller batch keeps server responsive
+            top_chunks, top_sims = topk_chunks_by_sim(chunks, policy_emb, k=TOP_K, batch_size=32)
 
-    # NEW: select top-K per investor without keeping all embeddings
-            top_chunks, top_sims = topk_chunks_by_sim(chunks, policy_emb, k=TOP_K, batch_size=64)
-
-            scored = [(c, *predict_vote(investor_policy, c)) for c in top_chunks]
+            # one batched classifier forward for the K pairs
+            preds, probs_against = batch_predict_votes(investor_policy, top_chunks)
+            scored = [(top_chunks[i], int(preds[i]), float(probs_against[i])) for i in range(len(top_chunks))]
             maj, conf, frac, mean_prob = weighted_decision(scored, top_sims)
-        
-            # NEW: if this investor appeared in the CSV "against" list,
-            # override the displayed verdict to AGAINST (but keep model run unchanged)
+
             maj_display = AGAINST_LABEL if bool(force_reason) else maj
-        
             verdict = "AGAINST" if maj_display == AGAINST_LABEL else "FOR"
-        
-            # Show a reason whenever the displayed verdict is AGAINST
+
             need_reason = (maj_display == AGAINST_LABEL)
-        
             reason_html = ""
             if need_reason:
                 if client is None or not OPENAI_API_KEY:
@@ -660,7 +639,7 @@ def upload_file(request: Request, file: UploadFile = File(...), policy: str = Fo
                     "<div style='background:#f7f7f7;padding:10px;border-left:4px solid #cc0000;"
                     "margin-top:6px;color:#333;'><b>Reason:</b><br>" + escape_html(reason_text) + "</div>"
                 )
-        
+
             yield (
                 f"<div class='result-block' data-investor='{html.escape(name, quote=True)}' "
                 f"data-verdict='{html.escape(verdict, quote=True)}'>"
@@ -670,16 +649,20 @@ def upload_file(request: Request, file: UploadFile = File(...), policy: str = Fo
                 f"<hr></div>"
             )
 
-
+        # Iterate investors
         if policy.lower() == "all":
-            for inv, pol in investor_policies.items():
-                # pass force_reason based on CSV mapping
+            inv_list = list(investor_policies.items())
+            total = len(inv_list)
+            yield f"<p>👥 {total} investors to process…</p>"
+            for idx, (inv, pol) in enumerate(inv_list, 1):
+                yield f"<p>➡️ {idx}/{total}: {escape_html(inv)}</p>"
                 yield from analyze_investor(inv, pol, force_reason=(inv in csv_force_reason_investors))
         else:
             pol = investor_policies.get(policy)
             if not pol:
                 yield f"<p>Unknown investor {html.escape(policy)}</p>"
                 return
+            yield f"<p>🔹 Running selection & classification for {html.escape(policy)}…</p>"
             yield from analyze_investor(policy, pol, force_reason=(policy in csv_force_reason_investors))
 
     return StreamingResponse(
@@ -687,7 +670,3 @@ def upload_file(request: Request, file: UploadFile = File(...), policy: str = Fo
         media_type="text/html",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
     )
-
-
-
-
