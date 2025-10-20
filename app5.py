@@ -588,6 +588,7 @@ def upload_file(request: Request, file: UploadFile = File(...), policy: str = Fo
             yield "<p>Document is too short to chunk.</p>"
             return
         chunk_embeddings = get_embeddings(chunks, batch_size=64)
+        yield f"<p>🔹 Running selection & classification for {html.escape(policy)}…</p>"
 
         # 3) Per-investor analysis
         def analyze_investor(name, investor_policy, force_reason=False):
@@ -644,3 +645,4 @@ def upload_file(request: Request, file: UploadFile = File(...), policy: str = Fo
             yield from analyze_investor(policy, pol, force_reason=(policy in csv_force_reason_investors))
 
     return StreamingResponse(stream(), media_type="text/html")
+
