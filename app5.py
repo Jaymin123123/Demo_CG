@@ -1,3 +1,6 @@
+import torch
+torch.set_num_threads(1)
+
 from fastapi import FastAPI, Form, UploadFile, File, Request, Response
 from fastapi.responses import HTMLResponse, StreamingResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -651,5 +654,6 @@ def upload_file(request: Request, file: UploadFile = File(...), policy: str = Fo
             yield from analyze_investor(policy, pol, force_reason=(policy in csv_force_reason_investors))
 
     return StreamingResponse(stream(), media_type="text/html")
+
 
 
