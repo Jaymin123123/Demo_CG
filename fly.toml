@@ -1,23 +1,24 @@
+# fly.toml
 app = "demo-cg"
-primary_region = "lhr"
+primary_region = "ams"
 
-[build]
-  # With a Dockerfile in the repo, Fly will use it automatically.
-
-[[services]]
+[http_service]
   internal_port = 8080
+  force_https = true
+  auto_start_machines = true
+  auto_stop_machines = false
+  min_machines_running = 1
   processes = ["app"]
 
-  [[services.ports]]
-    handlers = ["http"]
-    port = 80
+  [http_service.concurrency]
+    type = "requests"
+    soft_limit = 5
+    hard_limit = 10
 
-  [[services.ports]]
-    handlers = ["tls", "http"]
-    port = 443
-
-  [[services.http_checks]]
-    interval = 10000
-    timeout = 2000
+  # Health check tuned to tolerate CPU spikes
+  [[http_service.checks]]
     method = "GET"
     path = "/healthz"
+    interval = "10s"
+    timeout = "5s"
+    grace_period = "30s"
