@@ -1,18 +1,25 @@
 # pin to stable so apt packages exist
 FROM python:3.11-slim-bookworm
 
-# If you don't actually need OCR, you can drop tesseract-ocr entirely.
-# PyMuPDF and pdfminer.six generally don't need extra system libs.
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+ENV TOKENIZERS_PARALLELISM=false
+ENV OMP_NUM_THREADS=1
+ENV MKL_NUM_THREADS=1
+ENV NUMEXPR_NUM_THREADS=1
+
+# Only the minimal GUI libs some wheels expect
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    tesseract-ocr \
     libglib2.0-0 \
     libgl1 \
-    && rm -rf /var/lib/apt/lists/*
+  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Make sure torch is the CPU wheel (see note below)
+RUN pip install --no-cache-dir --upgrade pip \
+ && pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
