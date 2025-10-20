@@ -1,0 +1,23 @@
+app = "demo-cg"
+primary_region = "lhr"
+
+[build]
+  # With a Dockerfile in the repo, Fly will use it automatically.
+
+[[services]]
+  internal_port = 8080
+  processes = ["app"]
+
+  [[services.ports]]
+    handlers = ["http"]
+    port = 80
+
+  [[services.ports]]
+    handlers = ["tls", "http"]
+    port = 443
+
+  [[services.http_checks]]
+    interval = 10000
+    timeout = 2000
+    method = "GET"
+    path = "/healthz"
