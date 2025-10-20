@@ -590,7 +590,12 @@ def upload_file(request: Request, file: UploadFile = File(...), policy: str = Fo
         if not full_text.strip():
             yield "<p>No readable text found in document.</p>"
             return
+        
+        yield "<p>✅ Text extracted.</p>"
+        yield "<p>✂️ Chunking…</p>"
 
+        # after chunking (and before heavy work):
+        yield f"<p>⚙️ Computing embeddings & classifying for {html.escape(policy)}…</p>"
         # 2) Chunk + embed
         chunks = chunk_text(full_text)
         if not chunks:
@@ -654,6 +659,7 @@ def upload_file(request: Request, file: UploadFile = File(...), policy: str = Fo
             yield from analyze_investor(policy, pol, force_reason=(policy in csv_force_reason_investors))
 
     return StreamingResponse(stream(), media_type="text/html")
+
 
 
 
