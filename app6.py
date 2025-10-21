@@ -185,6 +185,16 @@ def load_company_against_investors_from_csv(csv_path: str) -> set[str]:
                 break
     return matched
 
+# put near other helpers, above routes
+INVESTOR_EMBS: dict[str, np.ndarray] = {}
+
+def get_policy_emb_cached(name: str, text: str) -> np.ndarray:
+    v = INVESTOR_EMBS.get(name)
+    if v is None:
+        v = get_embedding(text)
+        INVESTOR_EMBS[name] = v
+    return v
+
 # =============================================================
 # FastAPI setup
 # =============================================================
@@ -310,6 +320,35 @@ def chunk_text(text: str, max_tokens: int = 512, stride: int = 256, min_tokens: 
         if start + max_tokens >= len(ids):
             break
     return chunks
+# =============================================================
+# Decision helper
+# =============================================================
+def weighted_decision(scored, sims):
+    """
+    scored: list of tuples [(chunk_text, pred_label, prob_against), ...]
+    sims:   numpy array of similarity weights for the same K chunks
+    returns: (maj, conf, weighted_frac_against, weighted_mean_prob)
+    """
+    if not scored:
+        # default to FOR if nothing to score
+        return FOR_LABEL, 0.0, 0.0, 0.5
+
+    votes = np.array([v for _, v, _ in scored], dtype=float)
+    probs = np.array([p for _, _, p in scored], dtype=float)
+
+    weights = np.asarray(sims, dtype=float)
+    weights = weights + 1e-8  # avoid div-by-zero
+    weights = weights / weights.sum()
+
+    votes_against = (votes == AGAINST_LABEL).astype(float)
+
+    weighted_frac_against = float((votes_against * weights).sum())
+    weighted_mean_prob    = float((probs * weights).sum())
+
+    maj  = AGAINST_LABEL if weighted_frac_against >= AGAINST_THRESHOLD else FOR_LABEL
+    conf = abs(weighted_mean_prob - 0.5)
+
+    return maj, conf, weighted_frac_against, weighted_mean_prob
 
 # =============================================================
 # Classifier helpers
@@ -612,15 +651,16 @@ def upload_file(request: Request, file: UploadFile = File(...), policy: str = Fo
         yield f"<p>⚙️ Computing embeddings & classifying for {html.escape(label)}…</p>"
 
         def analyze_investor(name: str, investor_policy: str, force_reason=False):
-            # cached embedding
-            policy_emb = INVESTOR_EMBS.get(name) or get_embedding(investor_policy)
-
-            # top-K without full matrix; smaller batch keeps server responsive
+            v = INVESTOR_EMBS.get(name)
+            if v is None:
+                v = get_embedding(investor_policy)
+                INVESTOR_EMBS[name] = v
+            policy_emb = v
+        
             top_chunks, top_sims = topk_chunks_by_sim(chunks, policy_emb, k=TOP_K, batch_size=32)
-
-            # one batched classifier forward for the K pairs
             preds, probs_against = batch_predict_votes(investor_policy, top_chunks)
             scored = [(top_chunks[i], int(preds[i]), float(probs_against[i])) for i in range(len(top_chunks))]
+        
             maj, conf, frac, mean_prob = weighted_decision(scored, top_sims)
 
             maj_display = AGAINST_LABEL if bool(force_reason) else maj
