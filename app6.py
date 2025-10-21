@@ -1,5 +1,5 @@
 import torch
-torch.set_num_threads(1)
+torch.set_num_threads(8)
 
 from fastapi import FastAPI, Form, UploadFile, File, Request, Response
 from fastapi.responses import HTMLResponse, StreamingResponse, RedirectResponse
@@ -656,11 +656,11 @@ def upload_file(request: Request, file: UploadFile = File(...), policy: str = Fo
                 v = get_embedding(investor_policy)
                 INVESTOR_EMBS[name] = v
             policy_emb = v
-        
+
             top_chunks, top_sims = topk_chunks_by_sim(chunks, policy_emb, k=TOP_K, batch_size=32)
             preds, probs_against = batch_predict_votes(investor_policy, top_chunks)
             scored = [(top_chunks[i], int(preds[i]), float(probs_against[i])) for i in range(len(top_chunks))]
-        
+
             maj, conf, frac, mean_prob = weighted_decision(scored, top_sims)
 
             maj_display = AGAINST_LABEL if bool(force_reason) else maj
