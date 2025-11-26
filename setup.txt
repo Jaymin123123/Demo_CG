@@ -1,2 +1,13 @@
+Run this in terminal to setup environment:
 pip install fastapi python-docx transformers torch PyMuPDF scikit-learn openai uvicorn pandas numpy tqdm ipykernel notebook jupyter accelerate python-multipart runpod huggingface hf_transfer
+
+if you want the against reason bit to work then add a api key in the terminal using: export OPENAI_API_KEY='yourkeyhere'
+
+Then run this to start the server:
+uvicorn app-cpu2:app --host 0.0.0.0 --port 8080 --reload
+
+Go to http://127.0.0.1:8080 in browser
+
+
+This is for GPU setup SO IGNORE:
 uvicorn app5:app --host 0.0.0.0 --port 7860
