@@ -111,6 +111,8 @@ CSV_MAP = {
     "leg": os.getenv("LEG_CSV", "leg_against_votes.csv"),
     "asr": os.getenv("ASR_CSV", "asr_against_votes.csv"),
     "euronext": os.getenv("EURONEXT_CSV", "euronext_against_votes.csv"),
+    "oxford": os.getenv("OXFORD_CSV", "oxford_against_votes.csv"),
+    "cvc": os.getenv("CVC_CSV", "cvc_against_votes.csv"),
 }
 
 def _tokenize_name(s: str) -> list[str]:
@@ -564,6 +566,10 @@ def upload_file(request: Request, file: UploadFile = File(...), policy: str = Fo
         company_key = "asr"
     elif "euronext" in base:
         company_key = "euronext"
+    elif "oxford" in base:
+        company_key = "oxford"
+    elif "cvc" in base:
+        company_key = "cvc"
     elif "sainsbury" in base or "sainsbury's" in base or "j sainsbury" in base:
         company_key = "sainsbury"
 
